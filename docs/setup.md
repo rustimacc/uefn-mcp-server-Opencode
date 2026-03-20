@@ -6,11 +6,17 @@
 - Python 3.10+ installed on your system (for the MCP server process)
 - Claude Code CLI installed
 
+## Step 0: Let Claude do the setup
+
+Open Claude Code and ask: *"Help me set up UEFN MCP server"* — it will install dependencies, create config files, and walk you through the rest.
+
+If you prefer to do it manually, follow the steps below.
+
 ## Step 1: Enable Python in UEFN
 
 1. Open your project in UEFN
-2. Go to **Edit > Project Settings**
-3. Search for **Python** and check the boxes for **Python Editor Script Plugin**, **Editor Scripting Utilities**, and **Python Developer Mode**
+2. Go to **Project > Project Settings**
+3. Search for **Python** and check the box for **Python Editor Script Plugin**
 
 After this, you should see **Tools > Execute Python Script** in the menu bar.
 

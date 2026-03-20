@@ -12,11 +12,17 @@ Claude Code  <--stdio-->  MCP Server (mcp_server.py)  <--HTTP-->  Listener (uefn
 
 ## Quick Start
 
+### 0. Let Claude do the setup
+
+Open Claude Code and ask: *"Help me set up UEFN MCP server"* — it will install dependencies, create config files, and walk you through the rest.
+
+If you prefer to do it manually, follow steps 1-5 below.
+
 ### 1. Enable Python in UEFN
 
 1. Open your project in UEFN
-2. Go to **Edit > Project Settings**
-3. Search for **Python** and check the boxes for **Python Editor Script Plugin**, **Editor Scripting Utilities**, and **Python Developer Mode**
+2. Go to **Project > Project Settings**
+3. Search for **Python** and check the box for **Python Editor Script Plugin**
 
 ### 2. Start the listener inside UEFN
 
@@ -55,7 +61,7 @@ Create `.mcp.json` in your project root (or add to `~/.claude/settings.json`):
 
 Claude Code picks up `.mcp.json` on startup. After restart, you'll have 22 UEFN tools available.
 
-### 6. Try it
+### Try it
 
 Ask Claude Code:
 - *"List all actors in the level"*
