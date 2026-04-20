@@ -12,6 +12,59 @@
 3. Check the Output Log (Window > Output Log) for `[MCP] Listener started on http://127.0.0.1:8765`
 4. Verify with curl: `curl http://127.0.0.1:8765/`
 
+### "403 Authentication required" or "Invalid authentication token"
+
+**Cause:** The listener was started with `UEFN_MCP_TOKEN` set, so every request must include the `X-MCP-Token` header.
+
+**Fix:**
+1. Ensure your `.mcp.json` sets the same token for the MCP server process:
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_TOKEN": "your-token" }
+    }
+  }
+}
+```
+
+2. Restart the MCP client (OpenCode/Claude Code) so it restarts the server with that env.
+
+### "Command 'X' is blocked in read-only mode"
+
+**Cause:** `UEFN_MCP_READ_ONLY=1` is enabled.
+
+**Fix:**
+- Remove the env var or set it to `0`.
+- Keep it enabled if you want to prevent accidental mutations.
+
+### "Request too large" (HTTP 413)
+
+**Cause:** The client sent a payload bigger than the listener's `UEFN_MCP_MAX_REQUEST_BYTES` limit.
+
+**Fix:** Reduce the size of the request (e.g., avoid huge `execute_python` strings or massive params), or increase the limit:
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_MAX_REQUEST_BYTES": "4000000" }
+    }
+  }
+}
+```
+
+### "Actor class 'X' is disallowed by policy"
+
+**Cause:** `spawn_actor(actor_class=...)` was blocked by the denylist (defaults include `TextRenderActor`, which is often disallowed by UEFN content rules).
+
+**Fix:** Use a different actor class, or override the denylist via `UEFN_MCP_SPAWN_ACTOR_CLASS_DENYLIST`.
+
 ### "Connection refused" after listener was running
 
 **Cause:** The listener crashed or the editor was restarted.
@@ -92,6 +145,24 @@ result = 1 + 1
 - `TypeError`: Wrong argument types (use `unreal.Vector`, `unreal.Rotator`, etc.)
 - `RuntimeError`: Editor state doesn't allow the operation (e.g., saving during PIE)
 
+### "execute_python is disabled by policy"
+
+**Cause:** `execute_python` is disabled by default for safety.
+
+**Fix:** Enable it explicitly:
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_ENABLE_EXECUTE_PYTHON": "1" }
+    }
+  }
+}
+```
+
 ### `print()` output not visible
 
 **Cause:** By default, `print()` output goes to `stdout` which is captured and returned in the response.
@@ -103,7 +174,7 @@ unreal.log("My message")
 
 ## MCP Server Issues
 
-### Claude Code doesn't show UEFN tools
+### OpenCode/Claude Code doesn't show UEFN tools
 
 **Cause:** `.mcp.json` not found or MCP server failed to start.
 

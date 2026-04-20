@@ -1,13 +1,13 @@
 """MCP Server for UEFN Editor.
 
-External process that bridges Claude Code (stdio) to the UEFN HTTP listener.
+External process that bridges OpenCode (stdio) to the UEFN HTTP listener.
 Requires: pip install mcp
 
 Usage:
     python mcp_server.py
     python mcp_server.py --port 8765
 
-Claude Code config (~/.claude/settings.json or project .mcp.json):
+OpenCode config (~/.opencode/settings.json or project .mcp.json):
     {
       "mcpServers": {
         "uefn": {
@@ -33,9 +33,26 @@ from mcp.server.fastmcp import FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = int(os.environ.get("UEFN_MCP_PORT", "8765"))
-MAX_PORT = 8770
-REQUEST_TIMEOUT = 30.0
+try:
+    from config import (
+        DEFAULT_PORT,
+        MAX_PORT,
+        HEARTBEAT_INTERVAL,
+        REQUEST_TIMEOUT,
+        READ_ONLY,
+        ENABLE_EXECUTE_PYTHON,
+        DEBUG,
+        TOKEN,
+    )
+except ImportError:
+    DEFAULT_PORT = int(os.environ.get("UEFN_MCP_PORT", "8765"))
+    MAX_PORT = 8770
+    REQUEST_TIMEOUT = 30.0
+    HEARTBEAT_INTERVAL = 10.0
+    READ_ONLY = False
+    ENABLE_EXECUTE_PYTHON = False
+    DEBUG = False
+    TOKEN = ""
 
 _discovered_port: Optional[int] = None
 
@@ -105,10 +122,16 @@ def _send_command(command: str, params: Optional[dict] = None, timeout: float = 
     url = f"http://127.0.0.1:{port}"
 
     payload = json.dumps({"command": command, "params": params or {}}).encode()
+    
+    headers = {"Content-Type": "application/json"}
+    # Add auth token if configured
+    if TOKEN:
+        headers["X-MCP-Token"] = TOKEN
+    
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -131,7 +154,12 @@ def _send_command(command: str, params: Optional[dict] = None, timeout: float = 
     if not body.get("success", False):
         error_msg = body.get("error", "Unknown error")
         tb = body.get("traceback", "")
-        raise RuntimeError(f"UEFN command '{command}' failed: {error_msg}\n{tb}".strip())
+        
+        # Include traceback only in debug mode
+        if DEBUG and tb:
+            raise RuntimeError(f"UEFN command '{command}' failed: {error_msg}\n{tb}".strip())
+        else:
+            raise RuntimeError(f"UEFN command '{command}' failed: {error_msg}")
 
     return body.get("result", {})
 
@@ -151,7 +179,7 @@ def _check_connection() -> str:
 # Heartbeat — periodic ping so the listener knows we're alive
 # ---------------------------------------------------------------------------
 
-_HEARTBEAT_INTERVAL = 10.0
+_HEARTBEAT_INTERVAL = HEARTBEAT_INTERVAL
 
 
 def _heartbeat_loop() -> None:
@@ -589,6 +617,129 @@ def set_viewport_camera(
     if rotation is not None:
         params["rotation"] = rotation
     result = _send_command("set_viewport_camera", params)
+    return json.dumps(result, indent=2)
+
+
+# -- Enhanced tools ----------------------------------------------------------
+
+
+@mcp.tool()
+def get_project_summary() -> str:
+    """Get a comprehensive snapshot of the current project/editor state.
+
+    Returns project name, level info, actor counts by class, selection, and viewport.
+    Useful for quickly understanding the current editor state.
+    """
+    result = _send_command("get_project_summary")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def find_actors(
+    name_contains: str = "",
+    class_filter: str = "",
+    limit: int = 100,
+) -> str:
+    """Search actors by name/label with filters.
+
+    Args:
+        name_contains: Substring to match in actor name or label (case-insensitive).
+        class_filter: Filter by class name (e.g. 'StaticMeshActor').
+        limit: Maximum number of results (default 100).
+    """
+    result = _send_command("find_actors", {
+        "name_contains": name_contains,
+        "class_filter": class_filter,
+        "limit": limit,
+    })
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_actor_details(actor_path: str) -> str:
+    """Get comprehensive details about a single actor.
+
+    Args:
+        actor_path: Actor path name or label.
+    """
+    result = _send_command("get_actor_details", {"actor_path": actor_path})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def find_assets(
+    name_contains: str = "",
+    class_filter: str = "",
+    directory: str = "",
+    limit: int = 100,
+) -> str:
+    """Search assets by name with filters.
+
+    Args:
+        name_contains: Substring to match in asset name (case-insensitive).
+        class_filter: Filter by class name (e.g. 'Material', 'StaticMesh').
+        directory: Directory to search in (default: project root).
+        limit: Maximum number of results (default 100).
+    """
+    result = _send_command("find_assets", {
+        "name_contains": name_contains,
+        "class_filter": class_filter,
+        "directory": directory,
+        "limit": limit,
+    })
+    return json.dumps(result, indent=2)
+
+
+# -- Verse tools -------------------------------------------------------------
+
+
+@mcp.tool()
+def list_verse_files(directory: str = "") -> str:
+    """List all Verse (.verse) files in the project.
+
+    Args:
+        directory: Optional directory to search in (relative to project).
+    """
+    result = _send_command("list_verse_files", {"directory": directory})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def read_verse_file(file_path: str, max_lines: int = 200) -> str:
+    """Read contents of a Verse file.
+
+    Args:
+        file_path: Path to the .verse file (relative to project root).
+        max_lines: Maximum lines to return (default 200, use 0 for unlimited).
+    """
+    result = _send_command("read_verse_file", {
+        "file_path": file_path,
+        "max_lines": max_lines,
+    })
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def find_editable_bindings(file_path: str = "") -> str:
+    """Find @editable bindings in Verse files.
+
+    Args:
+        file_path: Optional specific file to search. If not provided, searches all .verse files.
+    """
+    result = _send_command("find_editable_bindings", {"file_path": file_path})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def scan_verse_symbols(file_path: str = "") -> str:
+    """Extract basic symbols from Verse files (classes, devices, functions).
+
+    This is a heuristic scan, not a full parser.
+
+    Args:
+        file_path: Optional specific file to scan. If not provided, scans all .verse files.
+    """
+    result = _send_command("scan_verse_symbols", {"file_path": file_path})
     return json.dumps(result, indent=2)
 
 

@@ -14,11 +14,11 @@ def _start_mcp():
     try:
         import uefn_listener
 
-        if uefn_listener._server is None:
+        if uefn_listener.unreal._mcp_server is None:
             port = uefn_listener.start_listener()
             unreal.log(f"[MCP] Auto-started on port {port}")
         else:
-            unreal.log(f"[MCP] Already running on port {uefn_listener._bound_port}")
+            unreal.log(f"[MCP] Already running on port {uefn_listener.unreal._mcp_bound_port}")
     except ImportError:
         unreal.log_warning(
             "[MCP] uefn_listener.py not found in Python path. "

@@ -11,6 +11,7 @@ Or auto-start via init_unreal.py.
 
 import io
 import json
+import os
 import queue
 import socket
 import sys
@@ -23,18 +24,118 @@ from typing import Any, Callable, Dict, List, Optional
 
 import unreal
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# Import config (try/except for standalone testing outside UEFN)
+try:
+    from config import (
+        PROTOCOL_VERSION,
+        DEFAULT_PORT,
+        MAX_PORT,
+        TICK_BATCH_LIMIT,
+        HTTP_TIMEOUT_SEC,
+        POLL_INTERVAL_SEC,
+        STALE_CLEANUP_SEC,
+        LOG_RING_SIZE,
+        READ_ONLY,
+        ENABLE_EXECUTE_PYTHON,
+        DEBUG,
+        TOKEN,
+        MAX_REQUEST_BYTES,
+        SPAWN_ACTOR_CLASS_DENYLIST,
+        is_read_only_command,
+        is_mutating_command,
+        is_dangerous_command,
+        is_command_allowed,
+    )
+    from policy import (
+        validate_command,
+        get_policy_summary,
+        format_error,
+        should_show_traceback,
+    )
+except ImportError:
+    # Fallback defaults if config not available
+    PROTOCOL_VERSION = "0.3.0"
+    DEFAULT_PORT = int(os.environ.get("UEFN_MCP_PORT", "8765"))
+    MAX_PORT = 8770
+    TICK_BATCH_LIMIT = 5
+    HTTP_TIMEOUT_SEC = 30.0
+    POLL_INTERVAL_SEC = 0.02
+    STALE_CLEANUP_SEC = 60.0
+    LOG_RING_SIZE = 200
+    MAX_REQUEST_BYTES = int(os.environ.get("UEFN_MCP_MAX_REQUEST_BYTES", "2000000"))
 
-PROTOCOL_VERSION = "0.2.0"
-DEFAULT_PORT = 8765
-MAX_PORT = 8770
-TICK_BATCH_LIMIT = 5
-HTTP_TIMEOUT_SEC = 30.0
-POLL_INTERVAL_SEC = 0.02
-STALE_CLEANUP_SEC = 60.0
-LOG_RING_SIZE = 200
+    # Security defaults MUST be safe in fallback mode.
+    READ_ONLY = os.environ.get("UEFN_MCP_READ_ONLY", "1").lower() in ("1", "true", "yes")
+    ENABLE_EXECUTE_PYTHON = os.environ.get("UEFN_MCP_ENABLE_EXECUTE_PYTHON", "").lower() in ("1", "true", "yes")
+    DEBUG = os.environ.get("UEFN_MCP_DEBUG", "").lower() in ("1", "true", "yes")
+    TOKEN = os.environ.get("UEFN_MCP_TOKEN", "")
+
+    SPAWN_ACTOR_CLASS_DENYLIST = {
+        s.strip().lower()
+        for s in os.environ.get("UEFN_MCP_SPAWN_ACTOR_CLASS_DENYLIST", "TextRenderActor").split(",")
+        if s.strip()
+    }
+    
+    def is_command_allowed(cmd: str):
+        # Minimal fallback policy: treat unknown as allowed, but enforce read-only and execute_python flag.
+        if READ_ONLY:
+            # Block obvious mutating/dangerous commands
+            if cmd in (
+                "spawn_actor",
+                "delete_actors",
+                "set_actor_transform",
+                "set_actor_properties",
+                "select_actors",
+                "focus_selected",
+                "rename_asset",
+                "delete_asset",
+                "duplicate_asset",
+                "save_asset",
+                "save_current_level",
+                "set_viewport_camera",
+                "shutdown",
+            ):
+                return False, f"Command '{cmd}' is blocked in read-only mode."
+        if cmd == "execute_python" and not ENABLE_EXECUTE_PYTHON:
+            return False, "execute_python is disabled by policy. Set UEFN_MCP_ENABLE_EXECUTE_PYTHON=1 to enable."
+        return True, ""
+
+    def validate_command(cmd: str, auth=None):
+        # Minimal auth + policy enforcement.
+        if TOKEN:
+            if not auth:
+                return False, "Authentication required. Provide X-MCP-Token header.", {
+                    "command": cmd,
+                    "auth_required": True,
+                    "auth_passed": False,
+                }
+            if auth != TOKEN:
+                return False, "Invalid authentication token.", {
+                    "command": cmd,
+                    "auth_required": True,
+                    "auth_passed": False,
+                }
+        allowed, msg = is_command_allowed(cmd)
+        return allowed, msg, {
+            "command": cmd,
+            "read_only_mode": READ_ONLY,
+            "execute_python_enabled": ENABLE_EXECUTE_PYTHON,
+            "auth_required": bool(TOKEN),
+            "auth_passed": True if (not TOKEN or auth == TOKEN) else False,
+        }
+
+    def get_policy_summary():
+        return {
+            "read_only_mode": READ_ONLY,
+            "execute_python_enabled": ENABLE_EXECUTE_PYTHON,
+            "auth_required": bool(TOKEN),
+            "debug_mode": DEBUG,
+            "fallback_mode": True,
+        }
+    def format_error(cmd, e, tb=None):
+        return str(e)
+    def should_show_traceback():
+        return False
 
 # ---------------------------------------------------------------------------
 # State
@@ -180,6 +281,105 @@ def _serialize_actor(actor: unreal.Actor) -> dict:
     }
 
 
+def _make_rotator(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0) -> unreal.Rotator:
+    """Create an unreal.Rotator with explicit fields.
+
+    UEFN's Python bindings can be ambiguous about the constructor argument order.
+    Setting fields explicitly enforces our tool contract: rotation=[pitch, yaw, roll].
+    """
+    r = unreal.Rotator()
+    r.pitch = float(pitch)
+    r.yaw = float(yaw)
+    r.roll = float(roll)
+    return r
+
+
+def _parse_rotation_list(rotation: Any) -> tuple[float, float, float]:
+    """Parse rotation input as [pitch, yaw, roll]."""
+    if rotation is None:
+        return 0.0, 0.0, 0.0
+    if not isinstance(rotation, (list, tuple)) or len(rotation) != 3:
+        raise ValueError("rotation must be a list of 3 floats: [pitch, yaw, roll]")
+    return float(rotation[0]), float(rotation[1]), float(rotation[2])
+
+
+def _is_convertible_asset_path(asset_path: str) -> bool:
+    """Best-effort filter for asset paths that break find_asset_data in UEFN.
+
+    UEFN can emit errors for internal Verse sub-assets like `$Digest` or task symbols.
+    """
+    if not asset_path:
+        return False
+    if "$" in asset_path:
+        return False
+    # Observed patterns that cause conversion errors in UEFN logs
+    if "task_" in asset_path and "$" in asset_path:
+        return False
+    if "\n" in asset_path or "\r" in asset_path:
+        return False
+    return True
+
+
+def _is_valid_asset_data(data: Any) -> bool:
+    """Check if AssetData appears valid."""
+    if data is None:
+        return False
+    try:
+        if hasattr(data, "is_valid") and callable(data.is_valid):
+            return bool(data.is_valid())
+    except Exception:
+        pass
+    # Fallback heuristic
+    try:
+        object_path = ""
+        if hasattr(data, "get_export_text_name"):
+            object_path = str(data.get_export_text_name())
+        elif hasattr(data, "object_path"):
+            object_path = str(data.object_path)
+        if not object_path or object_path.strip("'\"") == "":
+            return False
+        asset_name = str(getattr(data, "asset_name", ""))
+        if asset_name in ("", "None"):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _resolve_under_project(user_path: str) -> tuple[str, str]:
+    """Resolve a user-provided path under the UEFN project directory.
+
+    Returns: (full_path, rel_path)
+    Rejects absolute paths and any traversal outside project_dir.
+    """
+    import os
+
+    project_dir = os.path.abspath(str(unreal.Paths.project_dir()))
+    if not project_dir:
+        raise RuntimeError("Project directory not available")
+
+    if not user_path:
+        raise ValueError("Path is required")
+
+    # Disallow absolute paths outright
+    if os.path.isabs(user_path):
+        raise ValueError("Absolute paths are not allowed")
+
+    # Normalize and join
+    candidate = os.path.abspath(os.path.normpath(os.path.join(project_dir, user_path)))
+
+    # Ensure it stays under project_dir
+    try:
+        common = os.path.commonpath([project_dir, candidate])
+    except Exception:
+        common = project_dir
+    if common != project_dir:
+        raise ValueError("Path traversal outside the project directory is not allowed")
+
+    rel_path = os.path.relpath(candidate, project_dir)
+    return candidate, rel_path
+
+
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
@@ -197,10 +397,24 @@ def _register(name: str):
 
 def _dispatch(command: str, params: dict) -> dict:
     """Dispatch a command to its handler. Runs on main thread."""
+    import inspect
+
     handler = _HANDLERS.get(command)
     if handler is None:
         raise ValueError(f"Unknown command: {command}. Available: {list(_HANDLERS.keys())}")
-    return handler(**params)
+
+    # Filter unknown params to avoid breaking handlers when clients send extra fields.
+    try:
+        sig = inspect.signature(handler)
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if not accepts_kwargs:
+            allowed = set(sig.parameters.keys())
+            params = {k: v for k, v in (params or {}).items() if k in allowed}
+    except Exception:
+        # Best-effort; if signature introspection fails, fall back to original params
+        pass
+
+    return handler(**(params or {}))
 
 
 # -- System ------------------------------------------------------------------
@@ -333,7 +547,11 @@ def _cmd_spawn_actor(
     rotation: Optional[List[float]] = None,
 ) -> dict:
     loc = unreal.Vector(*location) if location else unreal.Vector(0, 0, 0)
-    rot = unreal.Rotator(*rotation) if rotation else unreal.Rotator(0, 0, 0)
+    if rotation is not None:
+        pitch, yaw, roll = _parse_rotation_list(rotation)
+        rot = _make_rotator(pitch, yaw, roll)
+    else:
+        rot = _make_rotator(0, 0, 0)
 
     if asset_path:
         asset = unreal.EditorAssetLibrary.load_asset(asset_path)
@@ -341,6 +559,12 @@ def _cmd_spawn_actor(
             raise ValueError(f"Asset not found: {asset_path}")
         actor = unreal.EditorLevelLibrary.spawn_actor_from_object(asset, loc, rot)
     elif actor_class:
+        # Policy: block spawning disallowed actor classes (UEFN content rules)
+        if actor_class.strip().lower() in SPAWN_ACTOR_CLASS_DENYLIST:
+            raise ValueError(
+                f"Actor class '{actor_class}' is disallowed by policy. "
+                "Configure UEFN_MCP_SPAWN_ACTOR_CLASS_DENYLIST to override."
+            )
         cls = getattr(unreal, actor_class, None)
         if cls is None:
             raise ValueError(f"Class not found: {actor_class}")
@@ -387,7 +611,8 @@ def _cmd_set_actor_transform(
     if location is not None:
         target.set_actor_location(unreal.Vector(*location), False, False)
     if rotation is not None:
-        target.set_actor_rotation(unreal.Rotator(*rotation), False)
+        pitch, yaw, roll = _parse_rotation_list(rotation)
+        target.set_actor_rotation(_make_rotator(pitch, yaw, roll), False)
     if scale is not None:
         target.set_actor_scale3d(unreal.Vector(*scale))
     return {"actor": _serialize_actor(target)}
@@ -489,7 +714,7 @@ def _cmd_focus_selected() -> dict:
     )
     cam_dist = spread * 1.5
     cam_loc = unreal.Vector(center_x - cam_dist * 0.5, center_y - cam_dist * 0.5, center_z + cam_dist * 0.5)
-    cam_rot = unreal.Rotator(-35, 45, 0)
+    cam_rot = _make_rotator(-35, 45, 0)
 
     unreal.EditorLevelLibrary.set_level_viewport_camera_info(cam_loc, cam_rot)
     return {
@@ -531,6 +756,475 @@ def _cmd_get_editor_log(last_n: int = 100, filter_str: str = "") -> dict:
         return {"lines": [], "error": str(e)}
 
 
+# -- Project Summary ---------------------------------------------------------
+
+
+@_register("get_project_summary")
+def _cmd_get_project_summary() -> dict:
+    """Get a comprehensive snapshot of the current project/editor state."""
+    world = unreal.EditorLevelLibrary.get_editor_world()
+    actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    all_actors = actor_sub.get_all_level_actors()
+    
+    # Count actors by class
+    class_counts: Dict[str, int] = {}
+    for actor in all_actors:
+        cls_name = actor.get_class().get_name()
+        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+    
+    # Get selected actors
+    selected = actor_sub.get_selected_level_actors()
+    
+    # Get project info
+    project_name = ""
+    content_root = ""
+    if world:
+        parts = world.get_path_name().split("/")
+        if len(parts) >= 2:
+            project_name = parts[1]
+            content_root = f"/{project_name}/"
+    
+    # Get viewport camera
+    try:
+        cam_loc, cam_rot = unreal.EditorLevelLibrary.get_level_viewport_camera_info()
+        viewport = {
+            "location": _serialize(cam_loc),
+            "rotation": _serialize(cam_rot),
+        }
+    except Exception:
+        viewport = None
+    
+    return {
+        "project_name": project_name,
+        "content_root": content_root,
+        "level_name": world.get_name() if world else "None",
+        "actor_count": len(all_actors),
+        "actor_class_counts": dict(sorted(class_counts.items(), key=lambda x: x[1], reverse=True)[:10]),
+        "selected_count": len(selected),
+        "selected_labels": [a.get_actor_label() for a in selected[:5]],
+        "viewport": viewport,
+    }
+
+
+# -- Actor Search -----------------------------------------------------------
+
+
+@_register("find_actors")
+def _cmd_find_actors(
+    name_contains: str = "",
+    class_filter: str = "",
+    limit: int = 100,
+) -> dict:
+    """Search actors by name/label with filters.
+    
+    Args:
+        name_contains: Substring to match in actor name or label (case-insensitive).
+        class_filter: Filter by class name (e.g. 'StaticMeshActor').
+        limit: Maximum number of results (default 100).
+    """
+    # Clamp limit
+    try:
+        limit = int(limit)
+    except Exception:
+        raise ValueError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > 1000:
+        limit = 1000
+
+    actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    actors = actor_sub.get_all_level_actors()
+    
+    results = []
+    pattern = name_contains.lower() if name_contains else None
+    
+    for actor in actors:
+        # Class filter
+        if class_filter and actor.get_class().get_name() != class_filter:
+            continue
+        
+        # Name filter
+        if pattern:
+            name = actor.get_name().lower()
+            label = actor.get_actor_label().lower()
+            if pattern not in name and pattern not in label:
+                continue
+        
+        results.append(_serialize_actor(actor))
+        if len(results) >= limit:
+            break
+    
+    return {"actors": results, "count": len(results), "limit": limit}
+
+
+@_register("get_actor_details")
+def _cmd_get_actor_details(actor_path: str) -> dict:
+    """Get comprehensive details about a single actor.
+    
+    Args:
+        actor_path: Actor path name or label.
+    """
+    actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    all_actors = actor_sub.get_all_level_actors()
+    
+    target = None
+    for a in all_actors:
+        if a.get_path_name() == actor_path or a.get_actor_label() == actor_path:
+            target = a
+            break
+    
+    if target is None:
+        raise ValueError(f"Actor not found: {actor_path}")
+    
+    # Gather common properties
+    hidden = None
+    try:
+        if hasattr(target, "is_hidden") and callable(getattr(target, "is_hidden")):
+            hidden = bool(target.is_hidden())
+    except Exception:
+        hidden = None
+
+    details = {
+        "name": target.get_name(),
+        "label": target.get_actor_label(),
+        "class": target.get_class().get_name(),
+        "path": target.get_path_name(),
+        "location": _serialize(target.get_actor_location()),
+        "rotation": _serialize(target.get_actor_rotation()),
+        "scale": _serialize(target.get_actor_scale3d()),
+        "hidden": hidden,
+        "tags": [str(t) for t in list(target.tags)] if hasattr(target, "tags") else [],
+    }
+    
+    # Try to get common component properties
+    try:
+        root = target.get_root_component()
+        if root:
+            details["root_component"] = {
+                "class": root.get_class().get_name(),
+                "mobility": str(root.get_editor_property("mobility")) if hasattr(root, 'get_editor_property') else None,
+            }
+    except Exception:
+        pass
+    
+    return {"actor": details}
+
+
+# -- Asset Search -----------------------------------------------------------
+
+
+@_register("find_assets")
+def _cmd_find_assets(
+    name_contains: str = "",
+    class_filter: str = "",
+    directory: str = "",
+    limit: int = 100,
+) -> dict:
+    """Search assets by name with filters.
+    
+    Args:
+        name_contains: Substring to match in asset name (case-insensitive).
+        class_filter: Filter by class name (e.g. 'Material', 'StaticMesh').
+        directory: Directory to search in (default: project root).
+        limit: Maximum number of results (default 100).
+    """
+    import os
+
+    # Clamp limit
+    try:
+        limit = int(limit)
+    except Exception:
+        raise ValueError("limit must be an integer")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > 1000:
+        limit = 1000
+
+    # Default to project content root
+    if not directory:
+        world = unreal.EditorLevelLibrary.get_editor_world()
+        if world:
+            parts = world.get_path_name().split("/")
+            if len(parts) >= 2:
+                directory = f"/{parts[1]}/"
+    if not directory:
+        directory = "/Game/"
+    
+    assets = unreal.EditorAssetLibrary.list_assets(directory, recursive=True)
+    
+    results = []
+    pattern = name_contains.lower() if name_contains else None
+    
+    for asset_path in assets:
+        asset_path_str = str(asset_path)
+
+        if not _is_convertible_asset_path(asset_path_str):
+            continue
+        
+        # Name filter
+        if pattern:
+            asset_name = os.path.basename(asset_path_str).lower()
+            if pattern not in asset_name:
+                continue
+        
+        # Class filter
+        if class_filter:
+            data = unreal.EditorAssetLibrary.find_asset_data(asset_path_str)
+            if not _is_valid_asset_data(data):
+                continue
+            cls = str(data.asset_class_path.asset_name) if hasattr(data, "asset_class_path") else str(getattr(data, "asset_class", ""))
+            if cls != class_filter:
+                continue
+        
+        # Get asset info
+        data = unreal.EditorAssetLibrary.find_asset_data(asset_path_str)
+        if _is_valid_asset_data(data):
+            results.append(_serialize(data))
+            if len(results) >= limit:
+                break
+    
+    return {"assets": results, "count": len(results), "limit": limit, "directory": directory}
+
+
+# -- Verse Context -----------------------------------------------------------
+
+
+def _find_verse_files(directory: str = "") -> List[str]:
+    """Find all .verse files in the project."""
+    import os
+    
+    # Get project directory
+    project_dir = str(unreal.Paths.project_dir())
+    if not project_dir:
+        return []
+    
+    verse_files = []
+    
+    # Search in common Verse locations
+    search_dirs = [
+        os.path.join(project_dir, "Content", "Verse"),
+        os.path.join(project_dir, "Source"),
+    ]
+    
+    if directory:
+        # Directory is always treated as relative to the project root.
+        full_dir, rel_dir = _resolve_under_project(directory)
+        search_dirs = [full_dir]
+    
+    for search_dir in search_dirs:
+        if not os.path.isdir(search_dir):
+            continue
+        for root, dirs, files in os.walk(search_dir):
+            for f in files:
+                if f.endswith(".verse"):
+                    rel_path = os.path.relpath(os.path.join(root, f), project_dir)
+                    verse_files.append(rel_path)
+    
+    return verse_files
+
+
+@_register("list_verse_files")
+def _cmd_list_verse_files(directory: str = "") -> dict:
+    """List all Verse (.verse) files in the project.
+    
+    Args:
+        directory: Optional directory to search in (relative to project).
+    
+    Returns:
+        List of .verse file paths relative to project root.
+    """
+    try:
+        files = _find_verse_files(directory)
+        return {
+            "files": files,
+            "count": len(files),
+            "directory": directory or "project root",
+        }
+    except Exception as e:
+        return {"files": [], "count": 0, "error": str(e)}
+
+
+@_register("read_verse_file")
+def _cmd_read_verse_file(file_path: str, max_lines: int = 200) -> dict:
+    """Read contents of a Verse file.
+    
+    Args:
+        file_path: Path to the .verse file (relative to project root, or absolute).
+        max_lines: Maximum lines to return (default 200, use 0 for unlimited).
+    """
+    import os
+
+    full_path, rel_path = _resolve_under_project(file_path)
+
+    if not rel_path.lower().endswith(".verse"):
+        return {"error": "Not a .verse file", "is_verse": False}
+
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {rel_path}", "exists": False}
+    
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            if max_lines == 0:
+                lines = f.readlines()
+            else:
+                lines = []
+                for i, line in enumerate(f):
+                    if i >= max_lines:
+                        break
+                    lines.append(line)
+        
+        response = {
+            "file_path": rel_path,
+            "lines": [l.rstrip() for l in lines],
+            "total_lines": len(lines),
+            "truncated": max_lines > 0 and len(lines) >= max_lines,
+        }
+        if DEBUG:
+            response["full_path"] = full_path
+        return response
+    except Exception as e:
+        return {"error": str(e), "file_path": rel_path}
+
+
+@_register("find_editable_bindings")
+def _cmd_find_editable_bindings(file_path: str = "") -> dict:
+    """Find @editable bindings in Verse files.
+    
+    Args:
+        file_path: Optional specific file to search. If not provided, searches all .verse files.
+    
+    Returns:
+        List of found @editable bindings with file, line number, and context.
+    """
+    import os
+    import re
+    
+    project_dir = str(unreal.Paths.project_dir())
+    
+    # Pattern to match @editable declarations
+    # Matches: @editable, @editable attribute = value
+    editable_pattern = re.compile(r'@editable\b')
+    # Try to capture the variable/function name that follows
+    name_pattern = re.compile(r'@editable\s+(?:var\s+)?(\w+)')
+    
+    results = []
+    
+    if file_path:
+        full_path, rel_path = _resolve_under_project(file_path)
+        if not rel_path.lower().endswith(".verse"):
+            return {"bindings": [], "count": 0, "error": "Not a .verse file"}
+        files_to_search = [rel_path]
+    else:
+        files_to_search = _find_verse_files()
+    
+    for verse_file in files_to_search:
+        # Resolve path (verse_file is relative)
+        full_path, rel_path = _resolve_under_project(verse_file)
+        
+        if not os.path.exists(full_path):
+            continue
+        
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_num, line in enumerate(f, 1):
+                    if editable_pattern.search(line):
+                        # Try to extract the name
+                        name_match = name_pattern.search(line)
+                        name = name_match.group(1) if name_match else ""
+                        
+                        results.append({
+                            "file": rel_path,
+                            "line": line_num,
+                            "name": name,
+                            "context": line.strip()[:100],
+                        })
+        except Exception:
+            continue
+    
+    return {
+        "bindings": results,
+        "count": len(results),
+        "files_searched": len(files_to_search),
+    }
+
+
+@_register("scan_verse_symbols")
+def _cmd_scan_verse_symbols(file_path: str = "") -> dict:
+    """Extract basic symbols from Verse files (classes, devices, functions).
+    
+    This is a heuristic scan, not a full parser.
+    
+    Args:
+        file_path: Optional specific file to scan. If not provided, scans all .verse files.
+    
+    Returns:
+        Symbols found: classes, devices, functions, events.
+    """
+    import os
+    import re
+    
+    project_dir = str(unreal.Paths.project_dir())
+    
+    # Patterns for common Verse constructs
+    patterns = {
+        "class": re.compile(r'class\s+(\w+)\s*(?:<[^>]+>)?\s*(?::\s*\w+)?(?:\s*\{)?'),
+        "struct": re.compile(r'struct\s+(\w+)\s*(?:\{)?'),
+        "device": re.compile(r'(\w+)\s*=\s*device\s*\{'),
+        "function": re.compile(r'(?:public\s+)?(\w+)\s*\([^)]*\)\s*(?::\s*\w+)?(?:\s*=\s*\{|;|\n)'),
+        "event": re.compile(r'(?:public\s+)?(\w+Event)\s*(?:<[^>]+>)?\s*(?::\s*\w+)?'),
+    }
+    
+    if file_path:
+        full_path, rel_path = _resolve_under_project(file_path)
+        if not rel_path.lower().endswith(".verse"):
+            return {"symbols": {}, "files_scanned": 0, "error": "Not a .verse file"}
+        files_to_search = [rel_path]
+    else:
+        files_to_search = _find_verse_files()
+    
+    symbols = {
+        "classes": [],
+        "structs": [],
+        "devices": [],
+        "functions": [],
+        "events": [],
+    }
+    
+    scanned_files = 0
+    
+    for verse_file in files_to_search:
+        # Resolve path (verse_file is relative)
+        full_path, rel_path = _resolve_under_project(verse_file)
+        
+        if not os.path.exists(full_path):
+            continue
+        
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+                scanned_files += 1
+                
+                # Extract symbols (heuristic, not 100% accurate)
+                for name, pattern in patterns.items():
+                    for match in pattern.finditer(content):
+                        symbol_name = match.group(1)
+                        if symbol_name and not symbol_name.startswith("_"):
+                            key = name + "s" if not name.endswith("s") else name
+                            if key in symbols:
+                                symbols[key].append({
+                                    "name": symbol_name,
+                                    "file": rel_path,
+                                })
+        except Exception:
+            continue
+    
+    return {
+        "symbols": symbols,
+        "files_scanned": scanned_files,
+        "note": "This is a heuristic scan, not a full parser. Results may not be complete.",
+    }
+
+
 # -- Assets -----------------------------------------------------------------
 
 
@@ -540,11 +1234,15 @@ def _cmd_list_assets(directory: str = "/Game/", recursive: bool = True, class_fi
     if class_filter:
         filtered = []
         for asset_path in assets:
-            data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
-            if data is not None:
-                cls = str(data.asset_class_path.asset_name) if hasattr(data, "asset_class_path") else str(getattr(data, "asset_class", ""))
-                if cls == class_filter:
-                    filtered.append(str(asset_path))
+            asset_path_str = str(asset_path)
+            if not _is_convertible_asset_path(asset_path_str):
+                continue
+            data = unreal.EditorAssetLibrary.find_asset_data(asset_path_str)
+            if not _is_valid_asset_data(data):
+                continue
+            cls = str(data.asset_class_path.asset_name) if hasattr(data, "asset_class_path") else str(getattr(data, "asset_class", ""))
+            if cls == class_filter:
+                filtered.append(asset_path_str)
         assets = filtered
     else:
         assets = [str(a) for a in assets]
@@ -553,9 +1251,14 @@ def _cmd_list_assets(directory: str = "/Game/", recursive: bool = True, class_fi
 
 @_register("get_asset_info")
 def _cmd_get_asset_info(asset_path: str) -> dict:
-    data = unreal.EditorAssetLibrary.find_asset_data(asset_path)
-    if data is None:
-        raise ValueError(f"Asset not found: {asset_path}")
+    asset_path_str = str(asset_path)
+    if not _is_convertible_asset_path(asset_path_str):
+        raise ValueError(f"Asset path is not convertible in UEFN: {asset_path_str}")
+
+    data = unreal.EditorAssetLibrary.find_asset_data(asset_path_str)
+    if not _is_valid_asset_data(data):
+        raise ValueError(f"Asset not found: {asset_path_str}")
+
     return {"asset": _serialize(data)}
 
 
@@ -605,8 +1308,11 @@ def _cmd_search_assets(class_name: str = "", directory: str = "/Game/", recursiv
     assets = unreal.EditorAssetLibrary.list_assets(directory, recursive=recursive)
     results = []
     for asset_path in assets:
-        data = unreal.EditorAssetLibrary.find_asset_data(str(asset_path))
-        if data is None:
+        asset_path_str = str(asset_path)
+        if not _is_convertible_asset_path(asset_path_str):
+            continue
+        data = unreal.EditorAssetLibrary.find_asset_data(asset_path_str)
+        if not _is_valid_asset_data(data):
             continue
         if class_name:
             cls = str(data.asset_class_path.asset_name) if hasattr(data, "asset_class_path") else str(getattr(data, "asset_class", ""))
@@ -674,7 +1380,11 @@ def _cmd_set_viewport_camera(
 ) -> dict:
     cur_loc, cur_rot = unreal.EditorLevelLibrary.get_level_viewport_camera_info()
     loc = unreal.Vector(*location) if location else cur_loc
-    rot = unreal.Rotator(*rotation) if rotation else cur_rot
+    if rotation is not None:
+        pitch, yaw, roll = _parse_rotation_list(rotation)
+        rot = _make_rotator(pitch, yaw, roll)
+    else:
+        rot = cur_rot
     unreal.EditorLevelLibrary.set_level_viewport_camera_info(loc, rot)
     return {"location": _serialize(loc), "rotation": _serialize(rot)}
 
@@ -698,21 +1408,39 @@ class _MCPHandler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             pass  # client disconnected (e.g. heartbeat timeout) — safe to ignore
 
+    def _get_auth_token(self) -> Optional[str]:
+        """Extract auth token from headers."""
+        return self.headers.get("X-MCP-Token")
+
     def do_GET(self) -> None:
         """Health check and tool manifest."""
         _metrics["last_client_ping"] = time.time()
-        body = json.dumps({
+        
+        # Build response with policy info
+        response = {
             "status": "ok",
             "version": PROTOCOL_VERSION,
             "port": unreal._mcp_bound_port,
             "commands": list(_HANDLERS.keys()),
-        }).encode()
+            "policy": get_policy_summary() if callable(get_policy_summary) else {},
+        }
+        
+        body = json.dumps(response).encode()
         self._send_json(200, body)
 
     def do_POST(self) -> None:
         """Execute a command."""
         _metrics["last_client_ping"] = time.time()
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_REQUEST_BYTES:
+            self._send_json(
+                413,
+                json.dumps({
+                    "success": False,
+                    "error": f"Request too large ({content_length} bytes). Max is {MAX_REQUEST_BYTES} bytes.",
+                }).encode(),
+            )
+            return
         raw = self.rfile.read(content_length)
         try:
             body = json.loads(raw)
@@ -724,6 +1452,19 @@ class _MCPHandler(BaseHTTPRequestHandler):
         params = body.get("params", {})
         if not command:
             self._send_json(400, json.dumps({"success": False, "error": "Missing 'command' field"}).encode())
+            return
+
+        # Validate command against policy
+        auth_token = self._get_auth_token()
+        allowed, error_msg, metadata = validate_command(command, auth_token)
+        
+        if not allowed:
+            _log(f"Command '{command}' blocked: {error_msg}", "warning")
+            self._send_json(403, json.dumps({
+                "success": False,
+                "error": error_msg,
+                "policy": metadata,
+            }).encode())
             return
 
         unreal._mcp_request_counter += 1
@@ -780,8 +1521,18 @@ def _tick_handler(delta_time: float) -> None:
             result = _dispatch(command, params)
             response = {"success": True, "result": result}
         except Exception as e:
+            tb_str = traceback.format_exc()
             _log(f"Command '{command}' failed: {e}", "error")
-            response = {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+            
+            # Use policy-aware error formatting
+            error_msg = format_error(command, e, tb_str) if callable(format_error) else str(e)
+            
+            # Include traceback only in debug mode
+            if should_show_traceback() if callable(should_show_traceback) else False:
+                response = {"success": False, "error": error_msg, "traceback": tb_str}
+            else:
+                response = {"success": False, "error": error_msg}
+            
             _metrics["total_errors"] += 1
             _metrics["last_error"] = str(e)
 

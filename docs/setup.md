@@ -4,11 +4,11 @@
 
 - UEFN editor with Python scripting enabled via **Project Settings**
 - Python 3.10+ installed on your system (for the MCP server process)
-- Claude Code CLI installed
+- OpenCode (recommended) or Claude Code CLI installed
 
-## Step 0: Let Claude do the setup
+## Step 0: Let the AI do the setup (optional)
 
-Open Claude Code and ask: *"Help me set up UEFN MCP server"* — it will install dependencies, create config files, and walk you through the rest.
+Open OpenCode (or Claude Code) and ask: *"Help me set up UEFN MCP server"* — it will install dependencies, create config files, and walk you through the rest.
 
 If you prefer to do it manually, follow the steps below.
 
@@ -29,7 +29,7 @@ After this, you should see **Tools > Execute Python Script** in the menu bar.
 3. A **status window** will appear:
 
 ```
-UEFN MCP Listener  v0.2.0
+    UEFN MCP Listener  v0.3.0
 ● Listener: Running
 ● MCP Server: Connecting...
 
@@ -44,11 +44,13 @@ You can safely close the window; the listener continues running in the backgroun
 
 ### Auto-start on editor launch
 
-Copy both files to your UEFN project's `Content/Python/` directory:
+Copy these files to your UEFN project's `Content/Python/` directory:
 
 ```bash
 cp uefn_listener.py  <YourUEFNProject>/Content/Python/uefn_listener.py
 cp init_unreal.py     <YourUEFNProject>/Content/Python/init_unreal.py
+cp config.py          <YourUEFNProject>/Content/Python/config.py
+cp policy.py          <YourUEFNProject>/Content/Python/policy.py
 ```
 
 The listener will start automatically every time you open the project in UEFN.
@@ -66,7 +68,7 @@ Verify:
 python -c "from mcp.server.fastmcp import FastMCP; print('OK')"
 ```
 
-## Step 4: Configure Claude Code
+## Step 4: Configure OpenCode (or Claude Code)
 
 ### Option A: Project-level config (recommended)
 
@@ -129,13 +131,65 @@ Or via environment variable:
 
 ## Step 5: Restart Claude Code
 
-Claude Code reads `.mcp.json` on startup. Start a new session:
+OpenCode/Claude Code reads `.mcp.json` on startup. Start a new session:
 
 ```bash
-claude
+  opencode
 ```
 
 The UEFN MCP tools should now be available. Test with: "ping the UEFN editor".
+
+## Security configuration (recommended)
+
+This MCP supports hardening via environment variables.
+
+### Read-only mode
+
+Blocks all mutating commands (spawn/move/rename/delete/save/etc.).
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_READ_ONLY": "1" }
+    }
+  }
+}
+```
+
+### Token authentication
+
+Requires an auth token on every HTTP request to the listener.
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_TOKEN": "change-me" }
+    }
+  }
+}
+```
+
+### Enable execute_python (disabled by default)
+
+`execute_python` runs arbitrary Python inside UEFN and is **disabled by default**.
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"],
+      "env": { "UEFN_MCP_ENABLE_EXECUTE_PYTHON": "1" }
+    }
+  }
+}
+```
 
 ## Listener Management
 

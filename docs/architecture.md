@@ -6,8 +6,9 @@ The system consists of two independently running Python processes connected by H
 
 ```
 ┌──────────────┐     stdio      ┌──────────────────┐     HTTP POST      ┌──────────────────────────┐
-│  Claude Code │ ◄────────────► │   MCP Server     │ ◄────────────────► │   UEFN Listener          │
-│  (AI client) │                │                  │   127.0.0.1:8765   │                          │
+│ OpenCode /   │ ◄────────────► │   MCP Server     │ ◄────────────────► │   UEFN Listener          │
+│ Claude Code  │                │                  │   127.0.0.1:8765   │                          │
+│ (AI client)  │                │                  │                    │                          │
 │              │                │  mcp_server.py   │                    │  uefn_listener.py        │
 └──────────────┘                └──────────────────┘                    └──────────────────────────┘
                                  Python 3.10+                            Python 3.11 (embedded)
@@ -41,7 +42,7 @@ The system consists of two independently running Python processes connected by H
 │  └──────────────────┘          └─────────────────────────┘  │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │              Command Handlers (22)                    │   │
+│  │              Command Handlers (36)                    │   │
 │  │  ping, execute_python, get_all_actors, spawn_actor,  │   │
 │  │  list_assets, get_viewport_camera, ...               │   │
 │  └──────────────────────────────────────────────────────┘   │
@@ -70,6 +71,15 @@ The system consists of two independently running Python processes connected by H
 | `POLL_INTERVAL_SEC` | 0.02 | Response poll interval (50 Hz) |
 | `STALE_CLEANUP_SEC` | 60.0 | Age after which orphan responses are deleted |
 | `LOG_RING_SIZE` | 200 | Max entries in the in-memory log buffer |
+
+### Security / policy (v0.3.0)
+
+The listener enforces a minimal policy layer before dispatching commands:
+
+- **Token auth (optional):** if `UEFN_MCP_TOKEN` is set, every request must include `X-MCP-Token`.
+- **Read-only mode:** `UEFN_MCP_READ_ONLY=1` blocks *all* mutating and dangerous commands.
+- **execute_python disabled by default:** enable with `UEFN_MCP_ENABLE_EXECUTE_PYTHON=1`.
+- **Less verbose errors by default:** full tracebacks only when `UEFN_MCP_DEBUG=1`.
 
 ### Serialization
 
@@ -126,17 +136,17 @@ def _cmd_my_command(param1: str, param2: int = 0) -> dict:
 ```
 
 Each MCP tool is a thin wrapper:
-1. Accepts typed parameters from Claude Code
+1. Accepts typed parameters from OpenCode/Claude Code
 2. Calls `_send_command("command_name", params)`
 3. Formats the result as a human-readable string
-4. Returns to Claude Code
+4. Returns to OpenCode/Claude Code
 
 ### Error handling
 
 | Scenario | Behavior |
 |----------|----------|
 | Listener not running | `ConnectionError` with instructions to start it |
-| Command fails in UEFN | `RuntimeError` with error message and Python traceback |
+| Command fails in UEFN | `RuntimeError` with error message (traceback only in debug mode) |
 | Command times out | `TimeoutError` after 30 seconds |
 | Invalid JSON response | Exception propagated to Claude Code |
 
@@ -144,12 +154,13 @@ Each MCP tool is a thin wrapper:
 
 ### HTTP Endpoints
 
-**GET /** — Health check and tool manifest
+**GET /** — Health check and tool manifest (includes policy summary)
 ```json
 {
   "status": "ok",
   "port": 8765,
   "commands": ["ping", "get_log", "execute_python", ...]
+  ,"policy": { "read_only_mode": false, "auth_required": false, ... }
 }
 ```
 
@@ -174,7 +185,7 @@ Each MCP tool is a thin wrapper:
 {
   "success": false,
   "error": "Actor not found: MyActor",
-  "traceback": "Traceback (most recent call last):\n..."
+  "traceback": "Traceback (most recent call last):\n..." // only when UEFN_MCP_DEBUG=1
 }
 ```
 
@@ -209,7 +220,7 @@ def my_new_command(param1: str, param2: int = 0) -> str:
 ### 3. Restart both
 
 - Restart the listener in UEFN: `py -c "import uefn_listener; uefn_listener.restart_listener()"`
-- Restart Claude Code to pick up the new tool
+- Restart OpenCode/Claude Code to pick up the new tool
 
 ## Design Decisions
 

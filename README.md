@@ -1,22 +1,23 @@
 # UEFN MCP Server
 
-Control [UEFN](https://dev.epicgames.com/documentation/en-us/fortnite/unreal-editor-for-fortnite) (Unreal Editor for Fortnite) from [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via the [Model Context Protocol](https://modelcontextprotocol.io/).
+Control [UEFN](https://dev.epicgames.com/documentation/en-us/fortnite/unreal-editor-for-fortnite) (Unreal Editor for Fortnite) from [OpenCode](https://github.com/opencode-ai/opencode) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via the [Model Context Protocol](https://modelcontextprotocol.io/).
 
 ```
-Claude Code  <--stdio-->  MCP Server (mcp_server.py)  <--HTTP-->  Listener (uefn_listener.py, inside UEFN)
+OpenCode/Claude  <--stdio-->  MCP Server (mcp_server.py)  <--HTTP-->  Listener (uefn_listener.py, inside UEFN)
 ```
 
-- **28 tools**: actors, assets, levels, viewport, project info, editor log, and arbitrary Python execution
+- **36 tools**: actors, assets, levels, viewport, project info, Verse context, and arbitrary Python execution
 - **Zero C++ compilation** — pure Python, works across UEFN versions
 - **Main-thread safe** — all `unreal.*` calls dispatched via editor tick callback
+- **Security hardening** — read-only mode, token auth, policy-based command filtering
 
 ## Quick Start
 
-### 0. Let Claude do the setup
+### 0. Install dependencies
 
-Open Claude Code and ask: *"Help me set up UEFN MCP server"* — it will install dependencies, create config files, and walk you through the rest.
-
-If you prefer to do it manually, follow steps 1-5 below.
+```bash
+pip install mcp
+```
 
 ### 1. Enable Python in UEFN
 
@@ -30,155 +31,213 @@ Use **Tools > Execute Python Script** in the UEFN menu bar, then select the `uef
 
 A **status window** will appear showing:
 - **Listener status** — green when running, red when stopped
-- **MCP Server status** — green when Claude Code is connected (heartbeat every 10s)
+- **MCP Server status** — green when connected (heartbeat every 10s)
 - **Port** — editable when listener is stopped
 - **Metrics** — uptime, request count, errors, last command, avg response time
 - **Controls** — Stop / Start / Restart buttons
 
-You can safely close this window — the listener continues running in the background.
+### 3. Configure OpenCode
 
-### 3. Install MCP SDK
-
-On your system (not inside UEFN):
-
-```bash
-pip install mcp
-```
-
-### 4. Configure Claude Code
-
-Create `.mcp.json` in your project root (or add to `~/.claude/settings.json`):
+Create `.mcp.json` in your project root:
 
 ```json
 {
   "mcpServers": {
     "uefn": {
       "command": "python",
-      "args": ["C:/path/to/uefn-mcp-server/mcp_server.py"]
+      "args": ["/path/to/uefn-mcp-server/mcp_server.py"]
     }
   }
 }
 ```
 
-### 5. Restart Claude Code
+### 4. Restart OpenCode
 
-Claude Code picks up `.mcp.json` on startup. After restart, you'll have 28 UEFN tools available.
+OpenCode picks up `.mcp.json` on startup. After restart, you'll have 36 UEFN tools available.
 
 ### Try it
 
-Ask Claude Code:
+Ask OpenCode:
+- *"Get project summary"*
 - *"List all actors in the level"*
+- *"Find actors with cube in the name"*
+- *"What Verse files are in the project?"*
 - *"Spawn a cube at position 100, 200, 300"*
-- *"What assets are in /Game/Materials/?"*
-- *"Move the viewport camera to look at the origin"*
+
+## Security Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `UEFN_MCP_PORT` | `8765` | HTTP port for the listener |
+| `UEFN_MCP_TOKEN` | `""` | Auth token (if set, requires `X-MCP-Token` header) |
+| `UEFN_MCP_READ_ONLY` | `false` | Block all mutating commands |
+| `UEFN_MCP_ENABLE_EXECUTE_PYTHON` | `false` | Enable `execute_python` (dangerous) |
+| `UEFN_MCP_DEBUG` | `false` | Show full tracebacks in errors |
+| `UEFN_MCP_MAX_REQUEST_BYTES` | `2000000` | Max HTTP request size accepted by the listener (DoS protection) |
+| `UEFN_MCP_SPAWN_ACTOR_CLASS_DENYLIST` | `TextRenderActor` | Comma-separated actor classes blocked in `spawn_actor` |
+| `UEFN_MCP_REQUEST_TIMEOUT` | `30.0` | External MCP server request timeout (seconds) |
+| `UEFN_MCP_HEARTBEAT_INTERVAL` | `10.0` | External MCP server heartbeat interval (seconds) |
+
+### Read-Only Mode
+
+To prevent accidental modifications:
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/mcp_server.py"],
+      "env": { "UEFN_MCP_READ_ONLY": "1" }
+    }
+  }
+}
+```
+
+### Token Authentication
+
+To require an auth token:
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/mcp_server.py"],
+      "env": { "UEFN_MCP_TOKEN": "your-secret-token" }
+    }
+  }
+}
+```
+
+The listener will validate the `X-MCP-Token` header on every request.
+
+### Enable execute_python (use with caution)
+
+```json
+{
+  "mcpServers": {
+    "uefn": {
+      "command": "python",
+      "args": ["/path/to/mcp_server.py"],
+      "env": { "UEFN_MCP_ENABLE_EXECUTE_PYTHON": "1" }
+    }
+  }
+}
+```
+
+## Tools
+
+### System
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `ping` | safe | Check if listener is running |
+| `get_log` | safe | Get recent MCP listener log entries |
+| `get_editor_log` | safe | Read UE Output Log |
+| `shutdown` | dangerous | Stop the listener |
+
+### Actors
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `get_all_actors` | safe | List all actors in level |
+| `get_selected_actors` | safe | Get currently selected actors |
+| `find_actors` | safe | Search actors by name/class |
+| `get_actor_details` | safe | Get comprehensive actor info |
+| `get_actor_properties` | safe | Read specific properties |
+| `spawn_actor` | mutating | Spawn an actor in level |
+| `delete_actors` | dangerous | Delete actors |
+| `set_actor_transform` | mutating | Set location/rotation/scale |
+| `set_actor_properties` | mutating | Set properties on actor |
+| `select_actors` | mutating | Select actors in viewport |
+| `focus_selected` | mutating | Focus viewport on selection |
+
+### Assets
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `list_assets` | safe | List assets in directory |
+| `get_asset_info` | safe | Get asset details |
+| `get_selected_assets` | safe | Get selected assets in Content Browser |
+| `find_assets` | safe | Search assets by name/class |
+| `does_asset_exist` | safe | Check if asset exists |
+| `search_assets` | safe | Search via Asset Registry |
+| `duplicate_asset` | mutating | Duplicate an asset |
+| `rename_asset` | mutating | Rename or move asset |
+| `save_asset` | mutating | Save modified asset |
+| `delete_asset` | dangerous | Delete an asset |
+
+### Project & Level
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `get_project_info` | safe | Get project name and content root |
+| `get_project_summary` | safe | Get comprehensive editor snapshot |
+| `get_level_info` | safe | Get current level info |
+| `save_current_level` | mutating | Save the level |
+
+### Viewport
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `get_viewport_camera` | safe | Get camera position/rotation |
+| `set_viewport_camera` | mutating | Move the camera |
+
+### Verse Context
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `list_verse_files` | safe | List all .verse files |
+| `read_verse_file` | safe | Read a Verse file |
+| `find_editable_bindings` | safe | Find @editable declarations |
+| `scan_verse_symbols` | safe | Extract symbols heuristically |
+
+### Python Execution
+
+| Tool | Risk Level | Description |
+|------|------------|-------------|
+| `execute_python` | dangerous | Run arbitrary Python in UEFN |
+
+**Warning**: `execute_python` is disabled by default. Enable with `UEFN_MCP_ENABLE_EXECUTE_PYTHON=1`.
 
 ## Auto-start (optional)
 
 To start the listener automatically when UEFN opens your project:
 
 ```bash
-# Copy both files to your UEFN project's Content/Python/ directory
 cp uefn_listener.py  <YourUEFNProject>/Content/Python/uefn_listener.py
 cp init_unreal.py     <YourUEFNProject>/Content/Python/init_unreal.py
+cp config.py          <YourUEFNProject>/Content/Python/config.py
+cp policy.py          <YourUEFNProject>/Content/Python/policy.py
 ```
 
 UEFN automatically executes `init_unreal.py` on project open.
 
-## Tools
-
-| Category | Tools |
-|----------|-------|
-| **System** | `ping`, `execute_python`, `get_log`, `get_editor_log`, `shutdown` |
-| **Actors** | `get_all_actors`, `get_selected_actors`, `spawn_actor`, `delete_actors`, `set_actor_transform`, `get_actor_properties`, `set_actor_properties`, `select_actors`, `focus_selected` |
-| **Assets** | `list_assets`, `get_asset_info`, `get_selected_assets`, `rename_asset`, `delete_asset`, `duplicate_asset`, `does_asset_exist`, `save_asset`, `search_assets` |
-| **Project** | `get_project_info` |
-| **Level** | `save_current_level`, `get_level_info` |
-| **Viewport** | `get_viewport_camera`, `set_viewport_camera` |
-
-The `execute_python` tool is the most powerful — it runs arbitrary Python code inside the editor with full access to the `unreal` module:
-
-```python
-# Pre-populated variables: unreal, actor_sub, asset_sub, level_sub, tk, get_tk_root
-# Assign to `result` to return a value
-
-actors = actor_sub.get_all_level_actors()
-result = [a.get_actor_label() for a in actors]
-```
-
-> **Tkinter note:** When creating UI windows via `execute_python`, use `get_tk_root()` + `tk.Toplevel(root)`. Never call `tk.Tk()` — multiple instances crash the editor.
-
 ## Architecture
 
-The system uses two independently running Python processes:
+```
+┌─────────────────┐     stdio     ┌──────────────┐     HTTP      ┌──────────────────┐
+│   OpenCode      │ ◄───────────► │  MCP Server  │ ◄───────────► │   UEFN Listener  │
+│   (AI client)   │               │              │   127.0.0.1   │                  │
+└─────────────────┘               │ mcp_server.py│               │ uefn_listener.py │
+                                  └──────────────┘               └──────────────────┘
+```
 
-| Component | File | Runs in | Python | Dependencies |
-|-----------|------|---------|--------|--------------|
-| **Listener** | `uefn_listener.py` | UEFN editor process | 3.11+ (embedded) | stdlib only |
-| **MCP Server** | `mcp_server.py` | External process | 3.10+ (system) | `mcp` SDK |
-
-**Why two processes?**
-- All `unreal.*` calls must happen on the editor's main thread (tick callback)
-- The MCP SDK needs pip-installable packages that can't be added to UEFN's embedded Python
-- Each component can restart independently
+- **MCP Server**: External Python process, connects via stdio to OpenCode
+- **UEFN Listener**: Runs inside UEFN editor, handles all `unreal.*` API calls
+- **Security**: Policy-based filtering, auth tokens, read-only mode
 
 See [docs/architecture.md](docs/architecture.md) for details.
 
-## Configuration
-
-### Custom port
-
-```json
-{
-  "mcpServers": {
-    "uefn": {
-      "command": "python",
-      "args": ["path/to/mcp_server.py", "--port", "8766"]
-    }
-  }
-}
-```
-
-Or via environment variable:
-
-```json
-{
-  "mcpServers": {
-    "uefn": {
-      "command": "python",
-      "args": ["path/to/mcp_server.py"],
-      "env": { "UEFN_MCP_PORT": "8766" }
-    }
-  }
-}
-```
-
-## Bonus Tools
-
-Scripts that run inside the UEFN editor to introspect the Python API.
-Run via **Tools > Execute Python Script** in the UEFN menu bar.
-
-| Script | Description |
-|--------|-------------|
-| [`tools/dump_uefn_api.py`](tools/dump_uefn_api.py) | Dump all classes, enums, structs, functions to JSON |
-| [`tools/generate_uefn_stub.py`](tools/generate_uefn_stub.py) | Generate `.pyi` type stub for IDE autocomplete (37K+ types) |
-| [`tests/test_feasibility.py`](tests/test_feasibility.py) | Verify UEFN sandbox supports HTTP/threading for MCP |
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Setup Guide](docs/setup.md) | Detailed installation and configuration |
-| [Tools Reference](docs/tools_reference.md) | All 28 tools with parameters, examples, and responses |
-| [Architecture](docs/architecture.md) | How the two-component system works internally |
-| [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions |
-| [UEFN Python Capabilities](docs/uefn_python_capabilities.md) | Full API capabilities map — 37K types across 30 domains |
-
 ## Requirements
 
-- UEFN editor with Python scripting enabled (Project Settings)
+- UEFN editor with Python scripting enabled
 - Python 3.10+ on host system
 - `pip install mcp`
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
+- OpenCode or Claude Code CLI
 
 ## License
 

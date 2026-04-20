@@ -1,6 +1,14 @@
 # Tools Reference
 
-28 tools organized in 6 categories. Each tool maps 1:1 to a listener command.
+36 tools organized in 7 categories. Each tool maps 1:1 to a listener command.
+
+## Risk Levels
+
+| Level | Description | Blocked in Read-Only? |
+|-------|-------------|------------------------|
+| **safe** | Read-only, no side effects | No |
+| **mutating** | Modifies state | Yes |
+| **dangerous** | High risk (deletion, arbitrary code) | Yes |
 
 ---
 
@@ -600,4 +608,219 @@ Get the UEFN project name and content root path. Use this to determine the corre
 **Response:**
 ```json
 { "project_name": "MyProject", "content_root": "/MyProject/", "project_dir": "../../../FortniteGame/" }
+```
+
+---
+
+## Verse Context *(new)*
+
+### `list_verse_files`
+
+List all Verse (.verse) files in the project.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `directory` | string | no | `""` | Optional directory to search (relative to project) |
+
+**Response:**
+```json
+{
+  "files": [
+    "Content/Verse/MyDevice.verse",
+    "Content/Verse/GameManager.verse"
+  ],
+  "count": 2,
+  "directory": "project root"
+}
+```
+
+---
+
+### `read_verse_file`
+
+Read contents of a Verse file.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `file_path` | string | yes | - | Path to .verse file (relative to project) |
+| `max_lines` | int | no | `200` | Maximum lines (0 = unlimited) |
+
+**Response:**
+```json
+{
+  "file_path": "Content/Verse/MyDevice.verse",
+  "full_path": "C:/Projects/MyProject/Content/Verse/MyDevice.verse",
+  "lines": ["using { /Verse.org/Devices }", "MyDevice := device {", "..."],
+  "total_lines": 50,
+  "truncated": false
+}
+```
+
+---
+
+### `find_editable_bindings`
+
+Find `@editable` declarations in Verse files. Useful for understanding what properties are exposed.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `file_path` | string | no | `""` | Specific file to search (empty = all files) |
+
+**Response:**
+```json
+{
+  "bindings": [
+    {
+      "file": "Content/Verse/MyDevice.verse",
+      "line": 15,
+      "name": "GameScore",
+      "context": "@editable var GameScore : int = 0"
+    }
+  ],
+  "count": 1,
+  "files_searched": 5
+}
+```
+
+---
+
+### `scan_verse_symbols`
+
+Extract basic symbols from Verse files using heuristic pattern matching. Not a full parser.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `file_path` | string | no | `""` | Specific file to scan (empty = all files) |
+
+**Response:**
+```json
+{
+  "symbols": {
+    "classes": [{"name": "PlayerState", "file": "Content/Verse/State.verse"}],
+    "structs": [{"name": "Position", "file": "Content/Verse/Types.verse"}],
+    "devices": [{"name": "GameManager", "file": "Content/Verse/GameManager.verse"}],
+    "functions": [{"name": "OnBeginPlay", "file": "Content/Verse/GameManager.verse"}],
+    "events": []
+  },
+  "files_scanned": 3,
+  "note": "This is a heuristic scan, not a full parser. Results may not be complete."
+}
+```
+
+---
+
+### `get_project_summary` *(new)*
+
+Get a comprehensive snapshot of the current project/editor state in a single call.
+
+**Parameters:** none
+
+**Response:**
+```json
+{
+  "project_name": "MyProject",
+  "content_root": "/MyProject/",
+  "level_name": "TestLevel",
+  "actor_count": 156,
+  "actor_class_counts": {
+    "StaticMeshActor": 45,
+    "PointLight": 12,
+    ...
+  },
+  "selected_count": 2,
+  "selected_labels": ["Cube", "Cube2"],
+  "viewport": {
+    "location": {"x": 500, "y": -200, "z": 300},
+    "rotation": {"pitch": -30, "yaw": 45, "roll": 0}
+  }
+}
+```
+
+---
+
+### `find_actors` *(new)*
+
+Search actors by name/label with filters. More ergonomic than `get_all_actors` for finding specific actors.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `name_contains` | string | no | `""` | Substring to match in name or label (case-insensitive) |
+| `class_filter` | string | no | `""` | Filter by class (e.g. `StaticMeshActor`) |
+| `limit` | int | no | `100` | Maximum results |
+
+**Response:**
+```json
+{
+  "actors": [...],
+  "count": 5,
+  "limit": 100
+}
+```
+
+---
+
+### `get_actor_details` *(new)*
+
+Get comprehensive details about a single actor, including common component properties.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `actor_path` | string | yes | Actor path name or label |
+
+**Response:**
+```json
+{
+  "actor": {
+    "name": "StaticMeshActor_0",
+    "label": "Cube",
+    "class": "StaticMeshActor",
+    "path": "/Game/Maps/Level...",
+    "location": {"x": 100, "y": 200, "z": 0},
+    "rotation": {"pitch": 0, "yaw": 45, "roll": 0},
+    "scale": {"x": 1, "y": 1, "z": 1},
+    "hidden": false,
+    "tags": ["interactive"],
+    "root_component": {
+      "class": "StaticMeshComponent",
+      "mobility": "EComponentMobility.STATIC"
+    }
+  }
+}
+```
+
+---
+
+### `find_assets` *(new)*
+
+Search assets by name with filters. More ergonomic than `list_assets` for finding specific assets.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `name_contains` | string | no | `""` | Substring to match in asset name |
+| `class_filter` | string | no | `""` | Filter by class (e.g. `Material`) |
+| `directory` | string | no | project root | Directory to search |
+| `limit` | int | no | `100` | Maximum results |
+
+**Response:**
+```json
+{
+  "assets": [...],
+  "count": 3,
+  "limit": 100,
+  "directory": "/MyProject/"
+}
 ```
